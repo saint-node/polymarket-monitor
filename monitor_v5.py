@@ -16,18 +16,31 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
 # ── Configuration ─────────────────────────────────
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
-TAVILY_API_KEY   = os.environ.get("TAVILY_API_KEY", "YOUR_TAVILY_KEY")
-OPENROUTER_KEY   = os.environ.get("OPENROUTER_KEY", "YOUR_OPENROUTER_KEY")
+TELEGRAM_TOKEN   = "8625060874:AAHArLnIo1m6PAtSIsNPNp918okNAi-LoAg"
+TELEGRAM_CHAT_ID = "8145872643"
+TAVILY_API_KEY   = "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"
+OPENROUTER_KEY   = "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"
+
+# Phase 0: observability trace (debug only; no behavior changes)
+DEBUG_TRACE = os.environ.get("DEBUG_TRACE", "false").lower() in ("1", "true", "yes", "y")
+DEBUG_TRACE_PROMPT_MAX_CHARS = int(os.environ.get("DEBUG_TRACE_PROMPT_MAX_CHARS", "800"))
+DEBUG_TRACE_TELEGRAM = os.environ.get("DEBUG_TRACE_TELEGRAM", "false").lower() in ("1", "true", "yes", "y")
+# scope: "confirmed_only" (news["found"]==True) or "all_spike"
+DEBUG_TRACE_TELEGRAM_SCOPE = os.environ.get("DEBUG_TRACE_TELEGRAM_SCOPE", "confirmed_only")
+# chunking
+DEBUG_TRACE_TELEGRAM_CHUNK_SIZE = int(os.environ.get("DEBUG_TRACE_TELEGRAM_CHUNK_SIZE", "3800"))
+DEBUG_TRACE_TELEGRAM_MAX_CHUNKS = int(os.environ.get("DEBUG_TRACE_TELEGRAM_MAX_CHUNKS", "8"))
 
 # ── Parameters ────────────────────────────────────
 SCAN_INTERVAL    = 300          # seconds between scans
 SPIKE_THRESHOLD  = 0.02         # minimum price move to trigger
 MIN_LIQUIDITY    = 2_000        # minimum market liquidity
 MIN_SPIKE_VOLUME = 20_000       # post-trigger volume filter for alerts
-SPIKE_COOLDOWN_MINUTES = 30     # suppress repeat alerts per market
-SEND_TRACKA_STATS_TO_TELEGRAM = True  # hourly Track A stats push
+# Dynamic cooldown (plan A): same-direction long vs reversal short
+COOLDOWN_LONG_MINUTES = 60
+COOLDOWN_REVERSAL_MINUTES = 30
+TRACKA_SIGNALS_PER_HOUR = int(os.environ.get("TRACKA_SIGNALS_PER_HOUR", "2"))
+SEND_TRACKA_STATS_TO_TELEGRAM = True  # 4h Track A stats push
 MIN_DAYS_LEFT    = 7            # minimum days to expiry
 PRICE_MIN        = 0.10         # expanded from 0.20
 PRICE_MAX        = 0.90         # expanded from 0.80
@@ -74,6 +87,7 @@ AUTHORITATIVE_SOURCES = [
 ]
 
 # ── Track B: RSS monitoring ────────────────────────
+RSS_ENABLED = os.environ.get("RSS_ENABLED", "false").lower() in ("1", "true", "yes", "y")
 RSS_INTERVAL = 180   # seconds between RSS checks (3 min)
 
 RSS_FEEDS = {
@@ -104,26 +118,51 @@ RSS_ENTITY_KEYWORDS = {
 price_history        = {}
 pending_news_checks  = {}
 seen_rss_articles    = set()   # URLs already alerted, avoids duplicates
-last_alert_time      = {}      # market_id -> unix ts for Track A cooldown
+tracka_last_signal   = {}        # market_id -> {"t": ts, "sgn": -1|0|1}
+tracka_signal_send_times = []    # send_alert/send_combined timestamps (1h window)
 
 tracka_stats = {
     "window_start": time.time(),
     "market_scans": 0,
     "markets_tracked_total": 0,
-    "spike_candidates": 0,       # reached SPIKE_THRESHOLD before extra filters
-    "filtered_min_volume": 0,    # filtered by MIN_SPIKE_VOLUME
-    "filtered_noise_band": 0,    # filtered by days_left/price noise rule
-    "spikes_passed_filters": 0,  # passed check_spike filters
-    "filtered_cooldown": 0,      # dropped by cooldown before alerting
-    "alerts_sent_markets": 0,    # markets alerted (single + combined)
-    "alerts_sent_messages": 0,   # telegram messages sent for Track A
-    "combined_alert_events": 0,  # combined alert message count
+    "spike_candidates": 0,
+    "filtered_min_volume": 0,
+    "filtered_noise_band": 0,
+    "spikes_passed_filters": 0,
+    "filtered_cooldown": 0,
+    "rate_limited_skips": 0,
+    "alerts_sent_markets": 0,
+    "alerts_sent_messages": 0,
+    "combined_alert_events": 0,
+    "chain_confirmed_with": 0,
+    "chain_confirmed_without": 0,
 }
 
 
 def format_pub_date(pub: str) -> str:
+    """News time: parsed -> raw string -> N/A."""
     dt = parse_pub_datetime(pub)
-    return dt.strftime("%m-%d %H:%M") if dt else "时间未知"
+    if dt:
+        return dt.strftime("%m-%d %H:%M")
+    if pub and str(pub).strip():
+        return str(pub).strip()[:48]
+    return "N/A"
+
+
+def _format_news_lines(articles: list, max_items: int = 2) -> str:
+    """Up to max_items headlines with full article URL and time."""
+    lines = []
+    for a in articles[:max_items]:
+        title = (a.get("title") or "").strip()
+        if len(title) > 120:
+            title = title[:117] + "..."
+        url = (a.get("url") or "").strip()
+        auth = a.get("authority") == "High"
+        lines.append(
+            f"{'🟢' if auth else '⚪'} {title}\n"
+            f"   {url} · {format_pub_date(a.get('pub_date'))}"
+        )
+    return "\n".join(lines)
 
 def parse_pub_datetime(pub: str) -> datetime | None:
     """
@@ -152,6 +191,163 @@ def extract_domain(url: str) -> str:
         return urlparse(url).netloc.replace("www.", "")
     except Exception:
         return url[:30]
+
+
+FALLBACK_NO_CHAIN = "未匹配到可在 HL 落地且新闻中有依据的标的。"
+
+# phrase (lower) -> HL ticker
+ASSET_ALIAS_TO_TICKER = [
+    ("bitcoin", "BTC"), ("btc", "BTC"), ("ethereum", "ETH"), ("ether", "ETH"),
+    ("solana", "SOL"), ("gold", "XAU"), ("silver", "XAG"), ("xauusd", "XAU"),
+]
+
+
+def extract_allowed_endpoints(articles: list) -> set[str]:
+    """Tickers in HYPERLIQUID_ASSETS that appear in title/content (word-boundary + aliases)."""
+    allowed: set[str] = set()
+    hl = set(HYPERLIQUID_ASSETS)
+    for a in articles:
+        blob = f"{a.get('title', '')} {a.get('content', '')}"
+        blob_for_tickers = blob
+        lower = blob.lower()
+        for phrase, tick in ASSET_ALIAS_TO_TICKER:
+            if phrase in lower and tick in hl:
+                allowed.add(tick)
+        for tick in HYPERLIQUID_ASSETS:
+            pat = rf"(?<![A-Za-z0-9]){re.escape(tick)}(?![A-Za-z0-9])"
+            if re.search(pat, blob_for_tickers, flags=re.IGNORECASE):
+                allowed.add(tick.upper() if tick.isalpha() else tick)
+    return {t for t in allowed if t in hl}
+
+
+def _parse_chain_blocks(llm_text: str) -> list[dict]:
+    """Split LLM output into chain blocks; extract star count and ticker from 资产： line."""
+    if not llm_text or not llm_text.strip():
+        return []
+    lines = llm_text.strip().splitlines()
+    blocks: list[list[str]] = []
+    cur: list[str] = []
+    for line in lines:
+        if re.match(r"^Chain \d+:", line.strip()):
+            if cur:
+                blocks.append(cur)
+            cur = [line]
+        else:
+            if cur is not None:
+                cur.append(line)
+    if cur:
+        blocks.append(cur)
+    out = []
+    for blk in blocks:
+        text = "\n".join(blk).strip()
+        if not text:
+            continue
+        first = blk[0].strip()
+        stars = first.count("★")
+        ticker = None
+        for line in blk:
+            m = re.match(r"^[\s]*资产[：:]\s*([A-Za-z0-9]+)", line.strip())
+            if m:
+                ticker = m.group(1).upper()
+                break
+        out.append({"raw": text, "stars": stars, "ticker": ticker})
+    return out
+
+
+def _strip_star_markers_for_display(text: str) -> str:
+    """Remove star rating from Chain headers; drop standalone 假设 lines' star refs optional."""
+    out_lines = []
+    for line in text.splitlines():
+        line = re.sub(r"^(Chain \d+):\s*★+", r"\1:", line)
+        out_lines.append(line)
+    return "\n".join(out_lines).strip()
+
+
+def post_validate_chain_analysis(raw_llm: str, allowed: set[str]) -> tuple[str, bool]:
+    """
+    Filter chains: endpoint in allowed, stars >= 4 (★★★★☆).
+    Returns (display_text, had_at_least_one_chain).
+    """
+    if not raw_llm or not raw_llm.strip():
+        return FALLBACK_NO_CHAIN, False
+    blocks = _parse_chain_blocks(raw_llm)
+    kept = []
+    for b in blocks:
+        if not b.get("ticker") or b["ticker"] not in allowed:
+            continue
+        if b["stars"] < 4:
+            continue
+        kept.append(b["raw"])
+    if not kept:
+        return FALLBACK_NO_CHAIN, False
+    merged = "\n\n".join(kept[:2])
+    merged = _strip_star_markers_for_display(merged)
+    return merged, True
+
+def _dbg_truncate(text: str, max_chars: int) -> str:
+    if text is None:
+        return ""
+    s = str(text)
+    if max_chars <= 0:
+        return s
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + f"...[truncated {len(s) - max_chars} chars]"
+
+_debug_trace_collector = None  # list[str] | None
+
+def _dbg_line(msg: str):
+    """
+    Debug line printer:
+    - always prints to stdout when DEBUG_TRACE is enabled
+    - when collector is active, also appends to the current trace buffer
+    """
+    if DEBUG_TRACE:
+        print(msg)
+    global _debug_trace_collector
+    if _debug_trace_collector is not None:
+        try:
+            _debug_trace_collector.append(str(msg))
+        except Exception:
+            pass
+
+def _send_message_plain(text: str):
+    """
+    Telegram sender without Markdown parsing to avoid formatting issues.
+    """
+    if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN":
+        print(f"\n{'='*55}\n{text}\n{'='*55}")
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "disable_web_page_preview": True,
+            },
+            timeout=10
+        )
+    except Exception as e:
+        print(f"[Telegram][plain] Failed: {e}")
+
+def _send_debug_trace_to_telegram(trace_text: str, header: str):
+    """
+    Send debug trace via Telegram in chunks (because LLM output can be very long).
+    """
+    if not DEBUG_TRACE_TELEGRAM:
+        return
+    if not trace_text.strip():
+        return
+
+    # Keep header small to avoid consuming the Telegram payload.
+    full = f"{header}\n\n{trace_text}"
+    chunks = [full[i:i + DEBUG_TRACE_TELEGRAM_CHUNK_SIZE] for i in range(0, len(full), DEBUG_TRACE_TELEGRAM_CHUNK_SIZE)]
+    chunks = chunks[:DEBUG_TRACE_TELEGRAM_MAX_CHUNKS]
+
+    for idx, chunk in enumerate(chunks, start=1):
+        suffix = f"\n\n[chunk {idx}/{len(chunks)}]"
+        _send_message_plain(chunk + suffix)
 
 
 # ── Market scanning ────────────────────────────────
@@ -253,6 +449,18 @@ def check_spike(market: dict) -> dict | None:
             tracka_stats["filtered_noise_band"] += 1
             return None
         tracka_stats["spikes_passed_filters"] += 1
+        if DEBUG_TRACE:
+            try:
+                print("\n" + "=" * 70)
+                print("[DEBUG_TRACE][TrackA] Spike candidate accepted by filters")
+                print(f"market_id={market['id']} category={market['category']}")
+                print(f"question={market['question']}")
+                print(f"price_was={last['price']} price_now={price} delta={delta} (abs={abs(delta)})")
+                print(f"days_left={market['days_left']} volume={market['volume']}")
+                print("=" * 70)
+            except Exception:
+                # Debug logs must never break the main loop.
+                pass
         return {
             "question":   market["question"],
             "price_now":  price,
@@ -269,16 +477,44 @@ def check_spike(market: dict) -> dict | None:
     return None
 
 
-def in_alert_cooldown(market_id: str | int, now_ts: float | None = None) -> bool:
+def _delta_sign(d: float) -> int:
+    if d > 0:
+        return 1
+    if d < 0:
+        return -1
+    return 0
+
+
+def in_tracka_signal_cooldown(market_id: str | int, spike_delta: float, now_ts: float | None = None) -> bool:
+    """Plan A: 60m same-direction repeat; 30m after sign reversal vs last signal."""
     now_ts = now_ts or time.time()
-    last_ts = last_alert_time.get(market_id)
-    if not last_ts:
+    prev = tracka_last_signal.get(market_id)
+    if not prev:
         return False
-    return (now_ts - last_ts) < (SPIKE_COOLDOWN_MINUTES * 60)
+    elapsed = now_ts - prev["t"]
+    s_new = _delta_sign(spike_delta)
+    s_old = prev["sgn"]
+    reversal = (s_new != s_old) and (s_new != 0) and (s_old != 0)
+    limit_sec = COOLDOWN_REVERSAL_MINUTES * 60 if reversal else COOLDOWN_LONG_MINUTES * 60
+    return elapsed < limit_sec
 
 
-def mark_alert_sent(market_id: str | int, now_ts: float | None = None):
-    last_alert_time[market_id] = now_ts or time.time()
+def mark_tracka_signal_sent(market_id: str | int, spike_delta: float, now_ts: float | None = None):
+    tracka_last_signal[market_id] = {
+        "t": now_ts or time.time(),
+        "sgn": _delta_sign(spike_delta),
+    }
+
+
+def tracka_signal_rate_limit_allows(now_ts: float | None = None) -> bool:
+    global tracka_signal_send_times
+    now_ts = now_ts or time.time()
+    tracka_signal_send_times = [t for t in tracka_signal_send_times if now_ts - t < 3600]
+    return len(tracka_signal_send_times) < TRACKA_SIGNALS_PER_HOUR
+
+
+def record_tracka_signal_send(now_ts: float | None = None):
+    tracka_signal_send_times.append(now_ts or time.time())
 
 
 # ── News search ────────────────────────────────────
@@ -337,6 +573,15 @@ def search_news(spike: dict) -> dict:
     cutoff   = now_dt - timedelta(hours=window_h)
 
     try:
+        if DEBUG_TRACE:
+            _dbg_line("\n" + "=" * 70)
+            _dbg_line("[DEBUG_TRACE][News] search_news()")
+            _dbg_line(f"trace_key={spike.get('market_id', '')}")
+            _dbg_line(f"category={spike['category']} window_h={window_h}")
+            _dbg_line(f"query={query}")
+            _dbg_line(f"cutoff_utc={cutoff.isoformat()}")
+            _dbg_line("=" * 70)
+
         r = requests.post(
             "https://api.tavily.com/search",
             json={
@@ -364,6 +609,16 @@ def search_news(spike: dict) -> dict:
                           for src in AUTHORITATIVE_SOURCES)
 
             pub_dt = parse_pub_datetime(pub)
+            if DEBUG_TRACE:
+                try:
+                    _dbg_line("\n[DEBUG_TRACE][News] Tavily article candidate")
+                    _dbg_line(f"title={title}")
+                    _dbg_line(f"url={url}")
+                    _dbg_line(f"pub_date_raw={pub}")
+                    _dbg_line(f"pub_date_parsed={(pub_dt.isoformat() if pub_dt else None)}")
+                    _dbg_line(f"authority={'High' if is_auth else 'Standard'}")
+                except Exception:
+                    pass
             if pub_dt and pub_dt < cutoff:
                 continue
             if (pub_dt is None) and (not is_auth):
@@ -411,16 +666,16 @@ def call_llm(prompt: str, max_tokens: int = 600) -> str:
         return ""
 
 
-def analyze_with_news(spike: dict, articles: list) -> str:
-    """
-    Single LLM call replacing the previous summarize_news + analyze_transmission_chain.
-    Raw articles go in directly — no intermediate summarization layer.
-    """
+def analyze_with_news(spike: dict, articles: list) -> tuple[str, bool]:
+    """LLM + post-validate. Skips LLM if no HL evidence in news text."""
     articles_text = "\n\n".join([
         f"[{a['authority']}] {a['title']}\nSource: {a['url']}\n{a['content']}"
         for a in articles
     ])
     hl_list = ", ".join(HYPERLIQUID_ASSETS)
+    allowed = extract_allowed_endpoints(articles)
+    if not allowed:
+        return FALLBACK_NO_CHAIN, False
 
     prompt = f"""你是一位跨市场传导链分析师。
 
@@ -435,7 +690,7 @@ Polymarket 预测市场刚刚出现显著波动：
 
 ---
 
-请列出置信度 ★★★★☆ 及以上的传导链条，最多输出3条，按置信度从高到低排列。
+请列出置信度 ★★★★☆ 及以上的传导链条，最多输出2条，按置信度从高到低排列。
 
 置信度由事件与资产之间的假设数量严格决定：
 ★★★★★ = 0个假设（事件直接涉及该资产）
@@ -460,11 +715,30 @@ Chain 2: ★★★★☆
 - ticker 符号保持英文（BTC、ETH 等）
 - 链条推理用中文输出"""
 
-    result = call_llm(prompt, max_tokens=600)
-    return result if result else "Unable to generate analysis."
+    if DEBUG_TRACE:
+        try:
+            _dbg_line("\n" + "=" * 70)
+            _dbg_line("[DEBUG_TRACE][TrackA] analyze_with_news()")
+            _dbg_line(f"trace_key={spike.get('market_id', '')}")
+            _dbg_line(f"articles_count={len(articles)}")
+            _dbg_line(f"allowed_endpoints={sorted(allowed)}")
+            _dbg_line("[DEBUG_TRACE][LLM prompt (truncated)]")
+            _dbg_line(_dbg_truncate(prompt, DEBUG_TRACE_PROMPT_MAX_CHARS))
+            _dbg_line("=" * 70)
+        except Exception:
+            pass
 
+    raw = call_llm(prompt, max_tokens=600)
+    if DEBUG_TRACE:
+        try:
+            _dbg_line("\n" + "-" * 70)
+            _dbg_line("[DEBUG_TRACE][LLM result]")
+            _dbg_line(raw)
+            _dbg_line("-" * 70)
+        except Exception:
+            pass
+    return post_validate_chain_analysis(raw, allowed)
 
-# ── Telegram alerts ────────────────────────────────
 
 def _send_message(text: str):
     if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN":
@@ -498,7 +772,7 @@ def send_alert(spike: dict, news: dict, analysis: str = ""):
     strategy  = "⚡ 近期到期 — Poly 均值回归优先" if spike["days_left"] <= 12 else "📡 适合 HL 传导链信号"
 
     confirmed = news["found"]
-    header    = "⚡ *Price Spike Alert*" if confirmed else "⚡ *Price Spike — Unconfirmed*"
+    header    = "⚡ *价格异动信号*" if confirmed else "⚡ *价格异动 — 待确认*"
 
     stats = (
         f"`{arrow} {delta_str}  ·  {spike['price_was']:.1%} → {spike['price_now']:.1%}`\n"
@@ -506,11 +780,7 @@ def send_alert(spike: dict, news: dict, analysis: str = ""):
     )
 
     if confirmed:
-        news_lines = "\n".join([
-            f"{'🟢' if a['authority'] == 'High' else '⚪'} {a['title'][:55]}\n"
-            f"   {extract_domain(a['url'])} · {format_pub_date(a['pub_date'])}"
-            for a in news["articles"][:3]
-        ])
+        news_lines = _format_news_lines(news["articles"], max_items=2)
         body = (
             f"*News:*\n{news_lines}\n\n"
             f"{analysis}\n\n"
@@ -540,11 +810,7 @@ def send_alert(spike: dict, news: dict, analysis: str = ""):
 def send_followup(spike: dict, news: dict, analysis: str):
     """Follow-up message for previously unconfirmed spikes (sent once, 5 min later)"""
     if news["found"]:
-        news_lines = "\n".join([
-            f"{'🟢' if a['authority'] == 'High' else '⚪'} {a['title'][:55]}\n"
-            f"   {extract_domain(a['url'])} · {format_pub_date(a['pub_date'])}"
-            for a in news["articles"][:3]
-        ])
+        news_lines = _format_news_lines(news["articles"], max_items=2)
         body = (
             f"✅ *新闻确认*\n\n"
             f"*News:*\n{news_lines}\n\n"
@@ -615,6 +881,18 @@ def search_news_combined(spikes: list) -> dict:
     query = f"{' '.join(all_kw[:10])} -polymarket -\"prediction market\""
 
     try:
+        if DEBUG_TRACE:
+            try:
+                _dbg_line("\n" + "=" * 70)
+                _dbg_line("[DEBUG_TRACE][News] search_news_combined()")
+                _dbg_line(f"spikes_count={len(spikes)}")
+                _dbg_line(f"trace_keys={[s.get('market_id') for s in spikes][:5]}")
+                _dbg_line(f"query={query}")
+                _dbg_line(f"cutoff_utc={cutoff.isoformat()}")
+                _dbg_line("=" * 70)
+            except Exception:
+                pass
+
         r = requests.post(
             "https://api.tavily.com/search",
             json={
@@ -633,6 +911,16 @@ def search_news_combined(spikes: list) -> dict:
             is_auth = any(src in a.get("url", "").lower() or src in a.get("title", "").lower()
                          for src in AUTHORITATIVE_SOURCES)
             pub_dt = parse_pub_datetime(pub)
+            if DEBUG_TRACE:
+                try:
+                    _dbg_line("\n[DEBUG_TRACE][News] Tavily combined article candidate")
+                    _dbg_line(f"title={a.get('title', '')}")
+                    _dbg_line(f"url={a.get('url', '')}")
+                    _dbg_line(f"pub_date_raw={pub}")
+                    _dbg_line(f"pub_date_parsed={(pub_dt.isoformat() if pub_dt else None)}")
+                    _dbg_line(f"authority={'High' if is_auth else 'Standard'}")
+                except Exception:
+                    pass
             if pub_dt and pub_dt < cutoff:
                 continue
             if (pub_dt is None) and (not is_auth):
@@ -650,8 +938,8 @@ def search_news_combined(spikes: list) -> dict:
         return {"found": False, "articles": []}
 
 
-def analyze_combined(spikes: list, articles: list) -> str:
-    """LLM call for multi-category events — all spikes + all articles in one pass."""
+def analyze_combined(spikes: list, articles: list) -> tuple[str, bool]:
+    """LLM + post-validate. Skips LLM if no HL evidence in news text."""
     spikes_text = "\n".join([
         f"• {s['question']} | {s['price_was']:.1%}→{s['price_now']:.1%}（{s['delta']:+.1%}）[{s['category']}]"
         for s in spikes
@@ -661,6 +949,9 @@ def analyze_combined(spikes: list, articles: list) -> str:
         for a in articles
     ])
     hl_list = ", ".join(HYPERLIQUID_ASSETS)
+    allowed = extract_allowed_endpoints(articles)
+    if not allowed:
+        return FALLBACK_NO_CHAIN, False
 
     prompt = f"""你是一位跨市场传导链分析师。
 
@@ -676,7 +967,7 @@ def analyze_combined(spikes: list, articles: list) -> str:
 
 ---
 
-请识别最可能的根本原因事件，并列出置信度 ★★★★☆ 及以上的跨市场传导链条，最多输出3条，按置信度从高到低排列。
+请识别最可能的根本原因事件，并列出置信度 ★★★★☆ 及以上的跨市场传导链条，最多输出2条，按置信度从高到低排列。
 
 置信度由事件与资产之间的假设数量严格决定：
 ★★★★★ = 0个假设（事件直接涉及该资产）
@@ -691,13 +982,38 @@ Chain 1: ★★★★★
 资产：[TICKER] [HL]
 假设：无
 
+Chain 2: ★★★★☆
+[事件] → [假设节点] → [TICKER]
+资产：[TICKER] [HL]
+假设：[具体说明这一个假设]
+
 规则：
 - 不判断方向（涨/跌），由用户决定
 - ticker 符号保持英文（BTC、ETH 等）
 - 链条推理用中文输出"""
 
-    result = call_llm(prompt, max_tokens=700)
-    return result if result else "Unable to generate analysis."
+    if DEBUG_TRACE:
+        try:
+            _dbg_line("\n" + "=" * 70)
+            _dbg_line("[DEBUG_TRACE][TrackA] analyze_combined()")
+            _dbg_line(f"spikes_count={len(spikes)} articles_count={len(articles)}")
+            _dbg_line(f"allowed_endpoints={sorted(allowed)}")
+            _dbg_line("[DEBUG_TRACE][LLM prompt (truncated)]")
+            _dbg_line(_dbg_truncate(prompt, DEBUG_TRACE_PROMPT_MAX_CHARS))
+            _dbg_line("=" * 70)
+        except Exception:
+            pass
+
+    raw = call_llm(prompt, max_tokens=700)
+    if DEBUG_TRACE:
+        try:
+            _dbg_line("\n" + "-" * 70)
+            _dbg_line("[DEBUG_TRACE][LLM result]")
+            _dbg_line(raw)
+            _dbg_line("-" * 70)
+        except Exception:
+            pass
+    return post_validate_chain_analysis(raw, allowed)
 
 
 def send_combined_alert(spikes: list, news: dict, analysis: str):
@@ -716,11 +1032,7 @@ def send_combined_alert(spikes: list, news: dict, analysis: str):
     ])
 
     if news["found"]:
-        news_lines = "\n".join([
-            f"{'🟢' if a['authority'] == 'High' else '⚪'} {a['title'][:55]}\n"
-            f"   {extract_domain(a['url'])} · {format_pub_date(a['pub_date'])}"
-            for a in news["articles"][:3]
-        ])
+        news_lines = _format_news_lines(news["articles"], max_items=2)
         body = (
             f"*News:*\n{news_lines}\n\n"
             f"{analysis}\n\n"
@@ -730,7 +1042,7 @@ def send_combined_alert(spikes: list, news: dict, analysis: str):
         body = "⚠️ *暂无新闻确认* — 可能为知情资金或跨市场情绪联动"
 
     msg = (
-        f"🌐 *Multi-Market Event — {cat_str}*\n\n"
+        f"🌐 *多市场信号 — {cat_str}*\n\n"
         f"*Markets:*\n{markets_text}\n\n"
         f"{body}\n\n"
         f"{links}\n"
@@ -743,54 +1055,118 @@ def send_combined_alert(spikes: list, news: dict, analysis: str):
 def handle_combined_event(spikes: list):
     now_ts = time.time()
     before = len(spikes)
-    spikes = [s for s in spikes if not in_alert_cooldown(s["market_id"], now_ts)]
+    spikes = [s for s in spikes if not in_tracka_signal_cooldown(s["market_id"], s["delta"], now_ts)]
     tracka_stats["filtered_cooldown"] += (before - len(spikes))
     if not spikes:
         print("  [Cooldown] Combined event skipped (all markets cooling down)")
         return
 
+    if not tracka_signal_rate_limit_allows(now_ts):
+        tracka_stats["rate_limited_skips"] += 1
+        print(f"  [Rate limit] Combined event skipped (cap {TRACKA_SIGNALS_PER_HOUR}/h)")
+        return
+
     cats = sorted(set(s["category"] for s in spikes))
     print(f"  🌐 Multi-category event: {', '.join(cats)} ({len(spikes)} markets)")
-    news = search_news_combined(spikes)
-    analysis = analyze_combined(spikes, news["articles"]) if news["found"] else ""
-    send_combined_alert(spikes, news, analysis)
+    global _debug_trace_collector
+    collector_started = False
+    analysis, has_chain = "", False
+    try:
+        if DEBUG_TRACE and DEBUG_TRACE_TELEGRAM:
+            _debug_trace_collector = []
+            collector_started = True
+            _dbg_line("\n[DEBUG_TRACE][TrackA][TelegramTrace] Combined spike received")
+            _dbg_line(f"trace_market_ids={[s.get('market_id') for s in spikes]}")
+            _dbg_line(f"categories={cats}")
+
+        news = search_news_combined(spikes)
+        if news["found"]:
+            analysis, has_chain = analyze_combined(spikes, news["articles"])
+        send_combined_alert(spikes, news, analysis)
+        record_tracka_signal_send(now_ts)
+        if news["found"]:
+            if has_chain:
+                tracka_stats["chain_confirmed_with"] += 1
+            else:
+                tracka_stats["chain_confirmed_without"] += 1
+
+        if news["found"] and DEBUG_TRACE_TELEGRAM_SCOPE == "confirmed_only":
+            trace_text = "\n".join(_debug_trace_collector or [])
+            header = f"[DEBUG_TRACE][Telegram][confirmed] Multi-Market ({len(spikes)} markets)"
+            _send_debug_trace_to_telegram(trace_text, header=header)
+    finally:
+        if collector_started:
+            _debug_trace_collector = None
+
     tracka_stats["alerts_sent_markets"] += len(spikes)
     tracka_stats["alerts_sent_messages"] += 1
     tracka_stats["combined_alert_events"] += 1
     for s in spikes:
-        mark_alert_sent(s["market_id"], now_ts)
+        mark_tracka_signal_sent(s["market_id"], s["delta"], now_ts)
 
 
 # ── Spike handling ─────────────────────────────────
 
 def handle_spike(spike: dict):
-    if in_alert_cooldown(spike["market_id"]):
+    if in_tracka_signal_cooldown(spike["market_id"], spike["delta"]):
         tracka_stats["filtered_cooldown"] += 1
         print(f"  [Cooldown] Skip repeat alert: {spike['question'][:50]}")
         return
 
-    print(f"  ⚡ Spike: {spike['question'][:50]} | {spike['delta']:+.1%}")
-    news = search_news(spike)
+    if not tracka_signal_rate_limit_allows():
+        tracka_stats["rate_limited_skips"] += 1
+        print(f"  [Rate limit] Skip signal (cap {TRACKA_SIGNALS_PER_HOUR}/h)")
+        return
 
-    if news["found"]:
-        analysis = analyze_with_news(spike, news["articles"])
-        send_alert(spike, news, analysis)
-        tracka_stats["alerts_sent_markets"] += 1
-        tracka_stats["alerts_sent_messages"] += 1
-        mark_alert_sent(spike["market_id"])
-    else:
-        send_alert(spike, news)  # unconfirmed, no analysis
-        tracka_stats["alerts_sent_markets"] += 1
-        tracka_stats["alerts_sent_messages"] += 1
-        mark_alert_sent(spike["market_id"])
-        if spike["market_id"] not in pending_news_checks:
-            print(f"  [News] Not found — queued for 1 follow-up")
-            pending_news_checks[spike["market_id"]] = {
-                "spike":      spike,
-                "next_check": time.time() + SCAN_INTERVAL,
-            }
+    print(f"  ⚡ Spike: {spike['question'][:50]} | {spike['delta']:+.1%}")
+    global _debug_trace_collector
+    collector_started = False
+    try:
+        if DEBUG_TRACE and DEBUG_TRACE_TELEGRAM:
+            _debug_trace_collector = []
+            collector_started = True
+            _dbg_line("\n[DEBUG_TRACE][TrackA][TelegramTrace] Spike received")
+            _dbg_line(f"market_id={spike.get('market_id')}")
+            _dbg_line(f"category={spike.get('category')}")
+            _dbg_line(f"question={spike.get('question')}")
+            _dbg_line(f"price_was={spike.get('price_was')} price_now={spike.get('price_now')} delta={spike.get('delta')} (abs={abs(spike.get('delta', 0))})")
+            _dbg_line(f"days_left={spike.get('days_left')} volume={spike.get('volume')}")
+
+        news = search_news(spike)
+
+        if news["found"]:
+            analysis, has_chain = analyze_with_news(spike, news["articles"])
+            send_alert(spike, news, analysis)
+            tracka_stats["alerts_sent_markets"] += 1
+            tracka_stats["alerts_sent_messages"] += 1
+            record_tracka_signal_send()
+            mark_tracka_signal_sent(spike["market_id"], spike["delta"])
+            if has_chain:
+                tracka_stats["chain_confirmed_with"] += 1
+            else:
+                tracka_stats["chain_confirmed_without"] += 1
+
+            if DEBUG_TRACE_TELEGRAM_SCOPE == "confirmed_only":
+                trace_text = "\n".join(_debug_trace_collector or [])
+                header = f"[DEBUG_TRACE][Telegram][confirmed] {spike.get('question','')[:60]}"
+                _send_debug_trace_to_telegram(trace_text, header=header)
         else:
-            print(f"  [News] Already pending follow-up — skipped")
+            send_alert(spike, news)  # unconfirmed, no analysis
+            tracka_stats["alerts_sent_markets"] += 1
+            tracka_stats["alerts_sent_messages"] += 1
+            record_tracka_signal_send()
+            mark_tracka_signal_sent(spike["market_id"], spike["delta"])
+            if spike["market_id"] not in pending_news_checks:
+                print(f"  [News] Not found — queued for 1 follow-up")
+                pending_news_checks[spike["market_id"]] = {
+                    "spike":      spike,
+                    "next_check": time.time() + SCAN_INTERVAL,
+                }
+            else:
+                print(f"  [News] Already pending follow-up — skipped")
+    finally:
+        if collector_started:
+            _debug_trace_collector = None
 
 
 def process_pending_checks():
@@ -803,9 +1179,36 @@ def process_pending_checks():
 
         spike = pending["spike"]
         print(f"  [News] Follow-up: {spike['question'][:45]}")
-        news     = search_news(spike)
-        analysis = analyze_with_news(spike, news["articles"]) if news["found"] else ""
-        send_followup(spike, news, analysis)
+        global _debug_trace_collector
+        collector_started = False
+        try:
+            if DEBUG_TRACE and DEBUG_TRACE_TELEGRAM:
+                _debug_trace_collector = []
+                collector_started = True
+                _dbg_line("\n[DEBUG_TRACE][TrackA][TelegramTrace] Follow-up spike received")
+                _dbg_line(f"market_id={spike.get('market_id')}")
+                _dbg_line(f"category={spike.get('category')}")
+                _dbg_line(f"question={spike.get('question')}")
+
+            news = search_news(spike)
+            if news["found"]:
+                analysis, has_chain = analyze_with_news(spike, news["articles"])
+                if has_chain:
+                    tracka_stats["chain_confirmed_with"] += 1
+                else:
+                    tracka_stats["chain_confirmed_without"] += 1
+            else:
+                analysis, has_chain = "", False
+            send_followup(spike, news, analysis)
+
+            if news["found"] and DEBUG_TRACE_TELEGRAM_SCOPE == "confirmed_only":
+                trace_text = "\n".join(_debug_trace_collector or [])
+                header = f"[DEBUG_TRACE][Telegram][confirmed][Follow-up] {spike.get('question','')[:60]}"
+                _send_debug_trace_to_telegram(trace_text, header=header)
+        finally:
+            if collector_started:
+                _debug_trace_collector = None
+
         to_remove.append(mid)
 
     for mid in to_remove:
@@ -924,7 +1327,9 @@ def send_startup():
         f"Price range: {PRICE_MIN:.0%} – {PRICE_MAX:.0%}\n"
         f"Spike threshold: {SPIKE_THRESHOLD:.0%}\n"
         f"Spike min volume: {MIN_SPIKE_VOLUME:,.0f}\n"
-        f"Spike cooldown: {SPIKE_COOLDOWN_MINUTES} min\n"
+        f"Signal cooldown: {COOLDOWN_LONG_MINUTES}m same-dir / {COOLDOWN_REVERSAL_MINUTES}m reversal\n"
+        f"Track A signals/hour cap: {TRACKA_SIGNALS_PER_HOUR}\n"
+        f"RSS (Track B): {'on' if RSS_ENABLED else 'off'}\n"
         f"Min days to expiry: {MIN_DAYS_LEFT}\n"
         f"Single-pass analysis (facts + chains)\n"
         f"Scan interval: {SCAN_INTERVAL // 60} min"
@@ -949,34 +1354,27 @@ def maybe_report_tracka_stats(now_ts: float):
 
     scans = tracka_stats["market_scans"]
     avg_markets = (tracka_stats["markets_tracked_total"] / scans) if scans else 0.0
+    cw = tracka_stats["chain_confirmed_with"]
+    cwo = tracka_stats["chain_confirmed_without"]
+    chain_total = cw + cwo
+    pct_s = f"{100.0 * cw / chain_total:.0f}%" if chain_total else "n/a"
 
-    line1 = (
-        f"扫描次数={scans} | 平均跟踪市场数={avg_markets:.1f} | "
-        f"触发候选数={tracka_stats['spike_candidates']} | "
-        f"通过筛选数={tracka_stats['spikes_passed_filters']}"
-    )
-    line2 = (
-        f"过滤: 成交量={tracka_stats['filtered_min_volume']} | "
-        f"噪声区间={tracka_stats['filtered_noise_band']} | "
-        f"冷却期={tracka_stats['filtered_cooldown']}"
-    )
-    line3 = (
-        f"告警: 市场数={tracka_stats['alerts_sent_markets']} | "
-        f"消息数={tracka_stats['alerts_sent_messages']} | "
-        f"合并事件数={tracka_stats['combined_alert_events']}"
+    line = (
+        f"Track A 近4h | 平均市场数={avg_markets:.1f} | "
+        f"候选={tracka_stats['spike_candidates']} | 通过筛选={tracka_stats['spikes_passed_filters']} | "
+        f"过滤:成交量={tracka_stats['filtered_min_volume']}/噪声={tracka_stats['filtered_noise_band']}/"
+        f"冷却={tracka_stats['filtered_cooldown']}/限速跳过={tracka_stats['rate_limited_skips']} | "
+        f"信号:市场={tracka_stats['alerts_sent_markets']}/消息={tracka_stats['alerts_sent_messages']}/"
+        f"合并={tracka_stats['combined_alert_events']} | "
+        f"新闻确认链条 有链={cw} 无链={cwo} 有链占比={pct_s}"
     )
 
-    print("\n[Track A 统计] 最近4小时")
-    print(f"  {line1}")
-    print(f"  {line2}")
-    print(f"  {line3}")
+    print("\n[Track A 统计] " + line)
 
     if SEND_TRACKA_STATS_TO_TELEGRAM:
         msg = (
-            "📊 *Track A 统计（最近4小时）*\n\n"
-            f"`{line1}`\n"
-            f"`{line2}`\n"
-            f"`{line3}`\n\n"
+            "📊 *Track A 统计（近4小时）*\n\n"
+            f"`{line}`\n\n"
             f"_{datetime.now().strftime('%H:%M:%S')}_"
         )
         _send_message(msg)
@@ -989,15 +1387,18 @@ def maybe_report_tracka_stats(now_ts: float):
     tracka_stats["filtered_noise_band"] = 0
     tracka_stats["spikes_passed_filters"] = 0
     tracka_stats["filtered_cooldown"] = 0
+    tracka_stats["rate_limited_skips"] = 0
     tracka_stats["alerts_sent_markets"] = 0
     tracka_stats["alerts_sent_messages"] = 0
     tracka_stats["combined_alert_events"] = 0
-
+    tracka_stats["chain_confirmed_with"] = 0
+    tracka_stats["chain_confirmed_without"] = 0
 
 def run():
     print("=" * 55)
-    print("Polymarket Monitor v5  (+RSS Track B)")
-    print(f"Threshold: {SPIKE_THRESHOLD:.0%} | Market scan: {SCAN_INTERVAL}s | RSS: {RSS_INTERVAL}s")
+    print("Polymarket Monitor v5" + ("  (+RSS Track B)" if RSS_ENABLED else ""))
+    rss_part = f" | RSS: {RSS_INTERVAL}s" if RSS_ENABLED else ""
+    print(f"Threshold: {SPIKE_THRESHOLD:.0%} | Market scan: {SCAN_INTERVAL}s{rss_part}")
     print("=" * 55)
     send_startup()
 
@@ -1012,7 +1413,7 @@ def run():
         ts  = datetime.now().strftime('%H:%M:%S')
 
         # ── Track B: RSS check ──────────────────────
-        if now - last_rss_check >= RSS_INTERVAL:
+        if RSS_ENABLED and (now - last_rss_check >= RSS_INTERVAL):
             print(f"\n[{ts}] RSS check")
             check_rss_feeds(baseline=not rss_baseline_done)
             rss_baseline_done = True

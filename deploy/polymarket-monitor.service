@@ -1,0 +1,20 @@
+[Unit]
+Description=Polymarket Monitor v6 (scan + LLM + Telegram + Supabase)
+Documentation=file:///root/polymarket-monitor/RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/polymarket-monitor
+ExecStart=/usr/bin/python3 /root/polymarket-monitor/monitor_v6.py
+Restart=on-failure
+RestartSec=5s
+StandardOutput=append:/root/polymarket-monitor/monitor.log
+StandardError=append:/root/polymarket-monitor/monitor.log
+KillSignal=SIGINT
+TimeoutStopSec=20s
+
+[Install]
+WantedBy=multi-user.target
